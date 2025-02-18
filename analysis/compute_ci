@@ -1,0 +1,247 @@
+import pandas as pd
+import numpy as np
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
+from scipy.stats import sem, t
+## this is the code for result collection: 
+# compute the average performances and confidence intervals by demographic groups
+
+
+def confidence_interval(data, confidence=0.95):
+    n = len(data)
+    mean = np.mean(data)
+    std_err = sem(data)
+    h = std_err * t.ppf((1 + confidence) / 2, n - 1)
+    return mean, h
+def merge_data(predictions, demo_df):
+    merged_results = []
+    for df in predictions:
+        df["hadm_id"] = df["hadm_id"].astype(int)
+        df["probabilities"] = df["probabilities"].apply(eval)  
+        df["predicted_labels"] = df["predicted_labels"].apply(eval)
+        df["true_labels"] = df["true_labels"].apply(eval)
+        merged_results.append(df.merge(demo_df, on="hadm_id", how="inner"))
+    return merged_results
+
+def compute_metrics(y_true, y_pred, y_prob):
+    metrics = {}
+    y_true = np.array([np.array(x, dtype=int) for x in y_true])
+    y_pred = np.array([np.array(x, dtype=int) for x in y_pred])
+    y_prob = np.array([np.array(x, dtype=float) for x in y_prob])
+    metrics["accuracy"] = accuracy_score(y_true, y_pred)
+    metrics["precision"] = precision_score(y_true, y_pred, average="samples")
+    metrics["recall"] = recall_score(y_true, y_pred, average="samples")
+    metrics["f1_micro"] = f1_score(y_true, y_pred, average="micro")
+    metrics["f1_macro"] = f1_score(y_true, y_pred, average="macro")
+    metrics["auc_mi"] = roc_auc_score(y_true, y_prob, average="micro")
+    fpr_values = []
+    for i in range(y_true.shape[1]):  
+        y_true_i = y_true[:, i]
+        y_pred_i = y_pred[:, i]
+        if len(np.unique(y_true_i)) > 1:
+            tn, fp, fn, tp = confusion_matrix(y_true_i, y_pred_i).ravel()
+            fpr_values.append(fp / (fp + tn) if (fp + tn) > 0 else 0)
+    metrics["fpr"] = np.mean(fpr_values) if fpr_values else None 
+
+    return metrics
+
+
+ethnicity_map = {
+    'WHITE - RUSSIAN': 'WHITE',
+    'WHITE - OTHER EUROPEAN': 'WHITE',
+    'WHITE - EASTERN EUROPEAN': 'WHITE',
+    'WHITE - BRAZILIAN': 'WHITE',
+    'BLACK/AFRICAN': 'BLACK/AFRICAN AMERICAN',
+    'BLACK/CAPE VERDEAN': 'BLACK/AFRICAN AMERICAN',
+    'BLACK/CARIBBEAN ISLAND': 'BLACK/AFRICAN AMERICAN',
+    'ASIAN - CHINESE': 'ASIAN',
+    'ASIAN - SOUTH EAST ASIAN': 'ASIAN',
+    'ASIAN - ASIAN INDIAN': 'ASIAN',
+    'ASIAN - KOREAN': 'ASIAN',
+    'HISPANIC OR LATINO': 'HISPANIC/LATINO',
+    'HISPANIC/LATINO - SALVADORAN': 'HISPANIC/LATINO',
+    'HISPANIC/LATINO - PUERTO RICAN': 'HISPANIC/LATINO',
+    'HISPANIC/LATINO - GUATEMALAN': 'HISPANIC/LATINO',
+    'HISPANIC/LATINO - CUBAN': 'HISPANIC/LATINO',
+    'HISPANIC/LATINO - COLUMBIAN': 'HISPANIC/LATINO',
+    'HISPANIC/LATINO - HONDURAN': 'HISPANIC/LATINO',
+    'HISPANIC/LATINO - DOMINICAN': 'HISPANIC/LATINO',
+    'HISPANIC/LATINO - MEXICAN': 'HISPANIC/LATINO',
+    'HISPANIC/LATINO - CENTRAL AMERICAN': 'HISPANIC/LATINO',
+    'SOUTH AMERICAN': 'HISPANIC/LATINO',
+    'PORTUGUESE':'OTHER/NOT REPORTED',
+    'AMERICAN INDIAN/ALASKA NATIVE':'OTHER/NOT REPORTED',
+    'MULTIPLE RACE/ETHNICITY':'OTHER/NOT REPORTED',
+    'NATIVE HAWAIIAN OR OTHER PACIFIC ISLANDER':'OTHER/NOT REPORTED',
+    'UNKNOWN': 'OTHER/NOT REPORTED',
+    'UNABLE TO OBTAIN': 'OTHER/NOT REPORTED',
+    'PATIENT DECLINED TO ANSWER': 'OTHER/NOT REPORTED',
+    'OTHER':'OTHER/NOT REPORTED'
+}
+
+def group_metrics(merged_results):
+    groups = ["gender", "age_group", "ethnicity_merged", "insurance"]
+    cross_groups = [("insurance", "ethnicity_merged")]  
+    seed_results = []
+
+    for df in merged_results:
+        group_metrics_per_seed = []
+        for group in groups:
+            for value in df[group].unique():
+                subset = df[df[group] == value]
+                y_true = list(subset["true_labels"])
+                y_pred = list(subset["predicted_labels"])
+                y_prob = list(subset["probabilities"])
+
+                if len(np.unique([item for sublist in y_true for item in sublist])) <= 1:
+                    print(f"Skipping group {group}={value}: only one class present in y_true.")
+                    continue
+
+                metrics = compute_metrics(y_true, y_pred, y_prob)
+                metrics["group"] = group
+                metrics["value"] = value
+                group_metrics_per_seed.append(metrics)
+        for group1, group2 in cross_groups:
+            for value1 in df[group1].unique():
+                for value2 in df[group2].unique():
+                    subset = df[(df[group1] == value1) & (df[group2] == value2)]
+                    y_true = list(subset["true_labels"])
+                    y_pred = list(subset["predicted_labels"])
+                    y_prob = list(subset["probabilities"])
+
+                    if len(np.unique([item for sublist in y_true for item in sublist])) <= 1:
+                        print(f"Skipping cross group {group1}={value1}, {group2}={value2}: only one class present in y_true.")
+                        continue
+
+                    metrics = compute_metrics(y_true, y_pred, y_prob)
+                    metrics["group"] = f"{group1}-{group2}"
+                    metrics["value"] = f"{value1} - {value2}"
+                    group_metrics_per_seed.append(metrics)
+
+        seed_results.append(pd.DataFrame(group_metrics_per_seed))
+    return seed_results
+
+def aggregate_seed_metrics(seed_metrics):
+    aggregated_results = []
+    for group in seed_metrics[0]["group"].unique():
+        for value in seed_metrics[0]["value"].unique():
+            metrics_per_seed = [
+                seed_df[(seed_df["group"] == group) & (seed_df["value"] == value)]
+                for seed_df in seed_metrics
+            ]
+            metrics_concat = pd.concat(metrics_per_seed)         
+            summary_metrics = {
+                "group": group,
+                "value": value,
+                "accuracy_ci": f"({metrics_concat['accuracy'].mean() * 100:.2f}, {confidence_interval(metrics_concat['accuracy'])[1] * 100:.2f})",
+                "precision_ci": f"({metrics_concat['precision'].mean() * 100:.2f}, {confidence_interval(metrics_concat['precision'])[1] * 100:.2f})",
+                "recall_ci": f"({metrics_concat['recall'].mean() * 100:.2f}, {confidence_interval(metrics_concat['recall'])[1] * 100:.2f})",
+                "f1_micro_ci": f"({metrics_concat['f1_micro'].mean() * 100:.2f}, {confidence_interval(metrics_concat['f1_micro'])[1] * 100:.2f})",
+                "f1_macro_ci": f"({metrics_concat['f1_macro'].mean() * 100:.2f}, {confidence_interval(metrics_concat['f1_macro'])[1] * 100:.2f})",
+                "auc_mi_ci": f"({metrics_concat['auc_mi'].mean() * 100:.2f}, {confidence_interval(metrics_concat['auc_mi'])[1] * 100:.2f})",
+                "fpr_ci": f"({metrics_concat['fpr'].mean() * 100:.2f}, {confidence_interval(metrics_concat['fpr'])[1] * 100:.2f})",
+            }
+            aggregated_results.append(summary_metrics)
+    return pd.DataFrame(aggregated_results)
+
+longformer_paths = [
+"/HDD16TB/Datasets/imbalance/clinicallongformer/predict_results_2024-11-29 10 46 06.csv",
+"/HDD16TB/Datasets/imbalance/clinicallongformer/predict_results_2024-11-29 12 04 53.csv",
+"/HDD16TB/Datasets/imbalance/clinicallongformer/predict_results_2024-11-29 12 05 37.csv",
+]
+gatortron_paths = [
+"/HDD16TB/Datasets/imbalance/GatorTron/predict_results_2024-11-29 03 06 40.csv",
+"/HDD16TB/Datasets/imbalance/GatorTron/predict_results_2024-11-29 03 19 03.csv",
+"/HDD16TB/Datasets/imbalance/GatorTron/predict_results_2024-11-29 03 34 15.csv",
+]
+longformer_4096_path=[
+    "/home/precious/Fall_Project/Imbalance_project/Clinical_Longformer/training_results_overall_icd_multilabel_classification/predict_results.csv",
+    "/home/precious/Fall_Project/Imbalance_project/Clinical_Longformer/training_results_overall_icd_multilabel_classification_clin_longf_3/predict_results.csv",
+    "/HDD16TB/Datasets/imbalance/clinicallongformer/predict_results_2024-12-08 07 58 56.csv"
+]
+clinical_bert_path=[
+    "/home/precious/Fall_Project/Imbalance_project/ClinicalBERT/training_results_overall_icd_multilabel_classification2/predict_results.csv",
+    "/home/precious/Fall_Project/Imbalance_project/ClinicalBERT/training_results_overall_icd_multilabel_classification_2nd_run/predict_results.csv",
+    "/home/precious/Fall_Project/Imbalance_project/ClinicalBERT/training_results_overall_icd_multilabel_classification_3rd_run/predict_results.csv",
+]
+
+longformer_4096_results = [pd.read_csv(path) for path in longformer_4096_path]
+clinical_bert_results = [pd.read_csv(path) for path in clinical_bert_path]
+gatortron_results = [pd.read_csv(path) for path in gatortron_paths]
+
+identification = pd.read_csv("/home/precious/Fall_Project/Imbalance_project/Data_identified/identified_attributes.csv")
+identification['ethnicity'].unique()
+
+identification['ethnicity_merged'] = identification['ethnicity'].replace(ethnicity_map)
+age_bins = [0, 17, 29, 49, 69, 89, 120]
+age_labels = ['17 and under', '18-29', '30-49', '50-69', '70-89', '90 and above']
+identification['age_group'] = pd.cut(identification['age'], bins=age_bins, labels=age_labels, right=False)
+
+longformer_merged = merge_data(longformer_4096_results, identification)
+clinical_bert_merged = merge_data(clinical_bert_results, identification)
+gatortron_merged = merge_data(gatortron_results, identification)
+
+#————————————grouped result of Clinical Longformer————————————————————
+longformer_seed_metrics = group_metrics(longformer_merged)
+longformer_aggregated_metrics = aggregate_seed_metrics(longformer_seed_metrics)
+longformer_aggregated_metrics.to_csv("longformer_aggregated_metrics_new.csv", index=False)
+#----————————-Clinical Longformer————————————————————
+longformer_overall_metrics = []
+for df in longformer_merged:
+    y_true = list(df["true_labels"])
+    y_pred = list(df["predicted_labels"])
+    y_prob = list(df["probabilities"])
+    metrics = compute_metrics(y_true, y_pred, y_prob)
+    longformer_overall_metrics.append(metrics)
+longformer_metrics_df = pd.DataFrame(longformer_overall_metrics)
+longformer_overall_summary = {
+    "accuracy_ci": f"({longformer_metrics_df['accuracy'].mean() * 100:.2f}, {confidence_interval(longformer_metrics_df['accuracy'])[1] * 100:.2f})",
+    "precision_ci": f"({longformer_metrics_df['precision'].mean() * 100:.2f}, {confidence_interval(longformer_metrics_df['precision'])[1] * 100:.2f})",
+    "recall_ci": f"({longformer_metrics_df['recall'].mean() * 100:.2f}, {confidence_interval(longformer_metrics_df['recall'])[1] * 100:.2f})",
+    "f1_micro_ci": f"({longformer_metrics_df['f1_micro'].mean() * 100:.2f}, {confidence_interval(longformer_metrics_df['f1_micro'])[1] * 100:.2f})",
+    "f1_macro_ci": f"({longformer_metrics_df['f1_macro'].mean() * 100:.2f}, {confidence_interval(longformer_metrics_df['f1_macro'])[1] * 100:.2f})",
+    "auc_mi_ci": f"({longformer_metrics_df['auc_mi'].mean() * 100:.2f}, {confidence_interval(longformer_metrics_df['auc_mi'])[1] * 100:.2f})",
+    "fpr_ci": f"({longformer_metrics_df['fpr'].mean() * 100:.2f}, {confidence_interval(longformer_metrics_df['fpr'])[1] * 100:.2f})"
+}
+print("Longformer Overall Metrics:", longformer_overall_summary)
+
+
+#--——————————---Clinical Bert————————————————————
+clinical_bert_overall_metrics = []
+for df in clinical_bert_merged:
+    y_true = list(df["true_labels"])
+    y_pred = list(df["predicted_labels"])
+    y_prob = list(df["probabilities"])
+    metrics = compute_metrics(y_true, y_pred, y_prob)
+    clinical_bert_overall_metrics.append(metrics)
+clinical_bert_metrics_df = pd.DataFrame(clinical_bert_overall_metrics)
+clinical_bert_overall_summary = {
+    "accuracy_ci": f"({clinical_bert_metrics_df['accuracy'].mean() * 100:.2f}, {confidence_interval(clinical_bert_metrics_df['accuracy'])[1] * 100:.2f})",
+    "precision_ci": f"({clinical_bert_metrics_df['precision'].mean() * 100:.2f}, {confidence_interval(clinical_bert_metrics_df['precision'])[1] * 100:.2f})",
+    "recall_ci": f"({clinical_bert_metrics_df['recall'].mean() * 100:.2f}, {confidence_interval(clinical_bert_metrics_df['recall'])[1] * 100:.2f})",
+    "f1_micro_ci": f"({clinical_bert_metrics_df['f1_micro'].mean() * 100:.2f}, {confidence_interval(clinical_bert_metrics_df['f1_micro'])[1] * 100:.2f})",
+    "f1_macro_ci": f"({clinical_bert_metrics_df['f1_macro'].mean() * 100:.2f}, {confidence_interval(clinical_bert_metrics_df['f1_macro'])[1] * 100:.2f})",
+    "auc_mi_ci": f"({clinical_bert_metrics_df['auc_mi'].mean() * 100:.2f}, {confidence_interval(clinical_bert_metrics_df['auc_mi'])[1] * 100:.2f})",
+    "fpr_ci": f"({clinical_bert_metrics_df['fpr'].mean() * 100:.2f}, {confidence_interval(clinical_bert_metrics_df['fpr'])[1] * 100:.2f})"
+}
+print("clinical_bert Overall Metrics:", clinical_bert_overall_summary)
+
+
+#————————————————GatorTron————————————————————
+gatortron_overall_metrics = []
+for df in gatortron_merged:
+    y_true = list(df["true_labels"])
+    y_pred = list(df["predicted_labels"])
+    y_prob = list(df["probabilities"])
+    metrics = compute_metrics(y_true, y_pred, y_prob)
+    gatortron_overall_metrics.append(metrics)
+gatortron_metrics_df = pd.DataFrame(gatortron_overall_metrics)
+gatortron_overall_summary = {
+    "accuracy_ci": f"({gatortron_metrics_df['accuracy'].mean() * 100:.2f}, {confidence_interval(gatortron_metrics_df['accuracy'])[1] * 100:.2f})",
+    "precision_ci": f"({gatortron_metrics_df['precision'].mean() * 100:.2f}, {confidence_interval(gatortron_metrics_df['precision'])[1] * 100:.2f})",
+    "recall_ci": f"({gatortron_metrics_df['recall'].mean() * 100:.2f}, {confidence_interval(gatortron_metrics_df['recall'])[1] * 100:.2f})",
+    "f1_micro_ci": f"({gatortron_metrics_df['f1_micro'].mean() * 100:.2f}, {confidence_interval(gatortron_metrics_df['f1_micro'])[1] * 100:.2f})",
+    "f1_macro_ci": f"({gatortron_metrics_df['f1_macro'].mean() * 100:.2f}, {confidence_interval(gatortron_metrics_df['f1_macro'])[1] * 100:.2f})",
+    "auc_mi_ci": f"({gatortron_metrics_df['auc_mi'].mean() * 100:.2f}, {confidence_interval(gatortron_metrics_df['auc_mi'])[1] * 100:.2f})",
+    "fpr_ci": f"({gatortron_metrics_df['fpr'].mean() * 100:.2f}, {confidence_interval(gatortron_metrics_df['fpr'])[1] * 100:.2f})"
+}
+print("GatorTron Overall Metrics:", gatortron_overall_summary)
